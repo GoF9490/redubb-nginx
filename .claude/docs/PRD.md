@@ -112,7 +112,7 @@
 | 대상 | 정책 |
 |---|---|
 | `/` 및 SPA 라우트 (`/auth/callback` 포함) | `try_files $uri $uri/ /index.html`, `Cache-Control: no-cache` (새 빌드 즉시 반영) |
-| `/assets/*` | `expires 1y`, `Cache-Control: public, max-age=31536000, immutable`, `try_files $uri =404` (없는 JS가 `index.html`로 대체 응답되는 것 방지) |
+| `/assets/*` | `Cache-Control: public, max-age=31536000, immutable`, `try_files $uri =404` (없는 JS가 `index.html`로 대체 응답되는 것 방지) |
 | 압축 | `gzip on` (js, css, json, svg) |
 
 * 정적 파일 루트는 `../frontend-dist`(프론트엔드 `npm run build` 출력)를 읽기 전용으로 마운트합니다. 해당 폴더가 비어 있으면 임시 `index.html`로 기동을 확인합니다(PRD-04 Step 1).
@@ -280,8 +280,11 @@ http {
             proxy_hide_header x-amz-id-2;
             proxy_hide_header x-amz-request-id;
             proxy_cache hls_cache;
+            proxy_cache_key "$uri";
+            proxy_cache_lock on;
             proxy_cache_valid 200 7d;
-            add_header Cache-Control "public, max-age=604800, immutable" always;
+            add_header Cache-Control "public, max-age=604800, immutable";
+            add_header X-Cache-Status $upstream_cache_status always;
             add_header Access-Control-Allow-Origin * always;
             include /etc/nginx/snippets/security-headers.conf;
         }
@@ -304,8 +307,7 @@ http {
         location /assets/ {
             root /usr/share/nginx/html;
             try_files $uri =404;
-            expires 1y;
-            add_header Cache-Control "public, max-age=31536000, immutable" always;
+            add_header Cache-Control "public, max-age=31536000, immutable";
             include /etc/nginx/snippets/security-headers.conf;
         }
 
@@ -329,7 +331,7 @@ http {
 | `proxy-backend.conf` | `proxy_pass http://backend_cluster;`, `proxy_http_version 1.1;`, §3.5의 헤더·타임아웃 |
 | `proxy-hls.conf` | `limit_except GET HEAD OPTIONS`, `rewrite ^/stream/(.*)$ /${STORAGE_BUCKET_NAME}/hls/$1 break;`, `proxy_pass http://s3_storage;`, `Host ${STORAGE_HOST_HEADER}`, `Authorization ""`, `proxy_cache hls_cache; proxy_cache_key "$uri"; proxy_cache_lock on;`, `X-Cache-Status`, CORS, `OPTIONS` ➔ `204`, 보안 헤더 |
 | `security-headers.conf` | `X-Content-Type-Options nosniff`, `Referrer-Policy no-referrer` |
-| `csp-spa.conf` | §3.7 CSP (초기 `Content-Security-Policy-Report-Only`) |
+| `csp-spa.conf` | §3.7 CSP (초기 `Content-Security-Policy-Report-Only`, T5-4에서 `Content-Security-Policy`로 강제 전환됨) |
 
 ## 5. 통합 docker 스택 명세
 
@@ -341,7 +343,7 @@ http {
 | `rustfs` | `rustfs/rustfs:latest` | `127.0.0.1:9000`, `127.0.0.1:9001` | S3 호환 스토리지 (PRD-06 §3) |
 | `storage-init` | `amazon/aws-cli:latest` | 없음 | 버킷 생성 + 익명 읽기 정책(`hls/*`, `artwork/*`만) 적용 후 종료 |
 | `web-server-1` / `web-server-2` | `${BACKEND_IMAGE:-music-backend:latest}` | 없음 (내부 `8080`만) | 백엔드 2노드 (`SPRING_PROFILES_ACTIVE=prod`) |
-| `nginx` | `nginx:1.26-alpine` (구현 시 현행 안정판 확인) | `80:80` | 유일한 외부 공개 포트 |
+| `nginx` | `nginx:1.30-alpine` (T1-1에서 확인: 1.26은 EOL, 2026-11-12 기준 stable 1.30.x) | `80:80` | 유일한 외부 공개 포트 |
 
 * **외부 공개 포트는 `80` 하나**입니다. PostgreSQL·RustFS는 루프백에만 바인딩하고, 백엔드는 호스트 포트를 노출하지 않습니다(PRD-01 §5.3).
 * **백엔드 이미지:** 백엔드 저장소가 빌드한 이미지(`music-backend:*`)를 참조합니다. 이 저장소에서 백엔드를 빌드하지 않습니다.
@@ -453,7 +455,7 @@ services:
             storage-init: { condition: service_completed_successfully }
 
     nginx:
-        image: nginx:1.26-alpine
+        image: nginx:1.30-alpine
         container_name: nginx-proxy
         restart: unless-stopped
         ports:
@@ -633,20 +635,26 @@ nginx/                               # 저장소 루트
 | 2 | `/stream/`의 모든 `200`을 24h 캐시 (주석은 "m3u8 최신 유지"라 하나 설정은 전체 캐시) | `.m3u8` 5초, `.ts` 24h로 location 분리 (rewrite 방식) | 매니페스트의 오래된 사본 방지, 의도와 설정 일치 |
 | 3 | - (신규 관찰) | 생성된 `index.m3u8`에 `#EXT-X-PLAYLIST-TYPE:VOD`가 없고 `#EXT-X-ENDLIST`만 있음. Nginx 변경 없이 시크·총 길이만 V-33에서 확인 | 백엔드 T7-3 보고, PRD-06 소관 |
 | 4 | `^/(api\|oauth2\|login/oauth2)/` (끝 슬래시 필수) | `(/\|$)`로 변경 | `/api` 단독이 SPA로 떨어지는 문제 |
-| 5 | `proxy_hide_header Content-Disposition` 유지 여부 미확정 | 유지하되 V-30을 1순위로 검증, 실패 시 제거하고 이 표에 결과 기록 | 백엔드 통합 확인 항목, PRD-04 §6-5 (결과 **미확인**) |
+| 5 | `proxy_hide_header Content-Disposition` 유지 여부 미확정 | 유지하되 V-30을 1순위로 검증, 실패 시 제거하고 이 표에 결과 기록 | 백엔드 통합 확인 항목, PRD-04 §6-5 (결과 **확인 완료 2026-11-12, T5-1**: V-30 통과. 200, 한글 `filename*=UTF-8''…` 유지, 본문 sha256 일치, `X-Accel-Redirect` 미노출. 백엔드가 지정한 `Content-Disposition`은 `X-Accel-Redirect` 내부 리다이렉트에서도 유지되고 `proxy_hide_header`는 RustFS 응답 헤더만 숨기므로 **`proxy_hide_header Content-Disposition` 유지로 확정**, 설정 변경 없음. V-32도 통과(서명 보존)) |
 | 6 | 헬스체크 `wget /` | 전용 `/healthz`, `127.0.0.1` 사용 | SPA 존재 의존 제거, alpine IPv6 해석 문제 회피 |
 | 7 | 없음 | 업로드·로그인 진입에 `limit_req`, `/stream`·`/artwork`에 허용 메서드 제한 | 남용·FFmpeg 큐 포화 방지, 쓰기 메서드 차단 |
-| 8 | CSP·보안 헤더 미정 (프론트엔드 §15 #4) | Nginx 직접 응답(SPA/stream/artwork)에만 적용, CSP는 Report-Only ➔ 강제 순서 (§3.7) | `/api`는 Spring이 이미 헤더를 붙임. CSP 최종 값은 V-51 후 확정 (**미확인**) |
+| 8 | CSP·보안 헤더 미정 (프론트엔드 §15 #4) | Nginx 직접 응답(SPA/stream/artwork)에만 적용, CSP는 Report-Only ➔ 강제 순서 (§3.7) | `/api`는 Spring이 이미 헤더를 붙임. CSP 최종 값은 V-51 후 확정 (**미확인**) — **강제 전환 완료(2026-11-12, T5-4)**: V-51 통과(완화한 지시어 없음, §3.7 초안 그대로). `Content-Security-Policy`(강제) 적용 후 SPA 로딩·hls.js 재생 정상, 주입한 인라인 스크립트는 차단됨 |
 | 9 | `X-Forwarded-Host $host` | `$http_host` (포트 포함) | 비표준 포트에서 `redirect_uri` 계산 오류 방지. 포트 `80`에서는 동일 동작이라 V-40/V-41로 확인 |
 | 10 | 업로드도 기본 요청 버퍼링 | 업로드만 `proxy_request_buffering off` | 110MB의 임시 디스크 쓰기 제거. 이 설정에서 `413`/연결 종료 동작은 V-24에서 확인 (**미확인**) |
 | 11 | compose 내 `storage-init`의 인라인 heredoc | `scripts/storage-init.sh`로 분리 | YAML 따옴표 이스케이프 오류 방지 (정책 내용 불변) |
 | 12 | `nginx.conf.template`만 템플릿 | 스니펫도 `templates/snippets/*.template`로 두고 `NGINX_ENVSUBST_FILTER` 지정 | location별 `add_header` 상속 단절을 `include`로 해결, 의도하지 않은 치환 방지 |
+| 13 | `/assets/`에서 `expires 1y` 제거, `/assets/`·`/artwork/`의 `add_header Cache-Control`에서 `always` 제거. `/artwork/`에 `proxy_cache_key "$uri"`, `proxy_cache_lock on`, `X-Cache-Status` 추가 | `expires`와 `add_header`가 `Cache-Control`을 두 줄로 내보내고, `always` 때문에 404에도 `immutable`이 붙어 오류 응답이 장기 캐시될 위험이 있었다(T1-3에서 발견) | 2xx/3xx에만 `Cache-Control` 한 줄 (`artwork`는 T2-2에서 적용). 캐시 키·락은 `/stream`과 동일 규칙(키 접두가 달라 충돌 없음) |
+| 14 | `/stream` 캐시 동작 확인 결과 (설정 변경 없음) | `proxy_ignore_headers` 불필요. `Range` MISS 시 전체 객체를 받아 캐시하고(이후 `Range` 호출은 `206`+`HIT`), `.m3u8`은 5초 후 `EXPIRED` | T5-2 검증: RustFS가 `Cache-Control`/`Expires`/`X-Accel-Expires`를 붙이지 않아 `proxy_cache_valid`가 적용됨. 캐시된 `206` 응답에는 `Accept-Ranges`가 없으나 `Content-Range`가 있어 `hls.js` 시크에는 영향이 없을 것으로 판단(브라우저 시크는 미확인) |
+| 15 | 업로드 한도 `110M`·`proxy_request_buffering off`의 `413` 동작 (V-24) | 설정 유지. `Content-Length` 111MB는 Nginx `413` JSON, 110MB 이하는 백엔드로 전달. 백엔드가 본문을 다 읽기 전에 응답(예: `415`)하면 chunked 초과 본문에서 Nginx `413`은 나오지 않음 | T4-3 검증: 호스트 `curl`로 큰 본문을 보내면 백엔드가 먼저 응답한 경우 응답을 못 받고 멈추는 현상이 재현됨(같은 compose 네트워크 안에서는 즉시 응답, Docker Desktop 포트 프록시 경로 추정, 미확정). 브라우저 실사용 업로드(110MB 이하)는 `202`로 정상(T5-5). 업로드 한도를 110MB 이하로 제한하는 운영 계획이라 영향 없음. 정상 multipart 110MB 초과 업로드는 미확인 |
+| 16 | 로그에 남는 값의 한계 (수용) | 접근 로그의 `$request`·`$http_referer`는 `token` 마스킹. 그러나 `error_log`와 `/login/oauth2/code/google` 콜백 URL의 Google 일회용 인가 코드(`code=`)는 마스킹하지 않음 | JWT가 아니고 단회용·PKCE 결합이라 수용. 413 JSON `timestamp`는 컨테이너 시간대(UTC, `+00:00`)이며 API.md 형식(`+09:00`)과 다르나 프론트엔드가 사용하지 않는 것으로 추정(저우선) |
 
 ### 11.3. 미결 (구현·통합 테스트 후 갱신)
 
-* V-30(헤더 유지), V-32(서명 보존), V-33(Range/캐시), V-51(CSP), V-24(110M·`request_buffering off`) 결과.
-* RustFS 경로별 버킷 정책 지원 여부(V-31).
-* nginx 이미지 태그(`1.26-alpine`)가 구현 시점에도 지원되는 안정판인지 확인(공식 릴리스 확인 후 기록).
+* **해결됨(2026-11-12, T5):** V-30(`Content-Disposition` 유지로 확정, §11.2 #5), V-32(서명 보존), V-33·V-34(`Range`/캐시, §11.2 #14), V-51(CSP 강제 전환, §11.2 #8), V-24(§11.2 #15), RustFS 경로별 정책(아래), nginx 이미지 태그(아래).
+* **미확인(사유):** V-41(개발 서버 `:5173` 경유 로그인 — 운영 기본값에 개발 콜백을 넣지 않았음), `/artwork/*` 실제 `Content-Type`(앨범아트가 있는 곡이 없음), 정상 multipart 110MB 초과 업로드의 브라우저 동작(업로드를 110MB 이하로 제한할 계획).
+* RustFS 경로별 버킷 정책 지원 여부(V-31): **확인 완료(2026-11-12, T4-1)**. `hls/*`·`artwork/*`만 익명 GET 허용, `original/`·버킷 목록은 403. rustfs 이미지에 `curl`·`wget`이 있어 PRD 헬스체크를 그대로 사용. `storage-init` 재실행 멱등성(버킷 존재 시 건너뜀, exit 0) 확인.
+* nginx 이미지 태그: **확인 완료(2026-11-12, T1-1)**. `1.26-alpine`은 EOL이고 Docker Hub에서 2025-04-16 이후 갱신이 없어 `1.30-alpine`(stable 1.30.x)으로 변경했다. 단독 컨테이너에서 `nginx -t`와 envsubst 치환 통과. `error_log`에는 `token` 마스킹이 적용되지 않아 쿼리가 평문으로 남을 수 있으므로(PRD 수용 한계) V-52는 `access.log` 기준으로 판정한다.
+* JWT 로그 마스킹 한계(T3-1 검증, 수용): `map`은 소문자 `token=` 파라미터만 마스킹한다. 대문자(`TOKEN=`), 퍼센트 인코딩(`%74oken=`, `token%3d`), 중복 `token` 파라미터의 앞쪽 값은 마스킹되지 않는다. 정상 콜백(`/auth/callback?token={jwt}`, 백엔드가 소문자 `token`을 1회 사용)에서는 발생하지 않으며, 이런 요청은 공격자가 자기 값을 직접 넣을 때만 생긴다. 필요해지면 `~*` 전환 등으로 강화한다.
 
 ## 12. MVP 이후 과제
 

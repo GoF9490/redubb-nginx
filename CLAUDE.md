@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 저장소 현황
 
-아직 구현 코드가 없고 **설계 문서만 있는 초기 상태**입니다(`.claude/docs/`). 빌드·린트·테스트 도구도 없습니다. 구현 대상은 **Nginx 리버스 프록시 + 통합 docker 스택**이며, 기준 문서는 `.claude/docs/PRD.md`입니다. 작업 순서는 PRD §13(N0~N5)을 따르고, 상세 태스크는 후속 `.claude/docs/ROADMAP.md`(`/docs:update-roadmap`이 갱신)로 분리될 예정입니다.
+**Nginx 리버스 프록시 + 통합 docker 스택**이 구현되어 있고 통합 검증(PRD §8)까지 마친 상태입니다. 기준 문서는 `.claude/docs/PRD.md`, 태스크 현황은 `.claude/docs/ROADMAP.md`(`/docs:update-roadmap`이 갱신)와 `.claude/docs/PROGRESS.md`입니다. 별도 빌드·린트 도구는 없으며 검증은 `scripts/smoke.sh`와 `scripts/integration-checklist.md`로 합니다. 검증 결과의 근거와 미확인 사유는 체크리스트와 PRD §11에 있습니다.
 
 이 저장소의 범위는 Nginx 설정, `docker-compose.yml`, `.env.example`, `db/init.sql`(PRD-07 §6 DDL을 **그대로 복사**), `scripts/storage-init.sh`, 검증 스크립트입니다. 백엔드·프론트엔드·모바일 코드는 다른 저장소 소관이므로 수정하지 않고, 필요한 변경은 PRD §10에 요청 사항으로만 기록합니다.
 
@@ -31,21 +31,27 @@ SPA가 쓸 수 없는 경로 접두는 `/api`, `/oauth2`, `/login/oauth2`, `/str
 - `add_header`는 location 단위로 상속이 끊기므로 보안 헤더·CSP는 스니펫을 `include`합니다. `/api` 경로 응답에는 Spring Security가 이미 헤더를 붙이므로 Nginx가 추가하지 않습니다.
 - 정규식 location은 `proxy_pass`에 URI를 쓸 수 없어 `/stream/`은 `rewrite … break;` 후 `proxy_pass http://s3_storage;`를 씁니다. `.m3u8`은 5초, `.ts`는 24h 캐시이고 404/5xx는 캐시하지 않습니다.
 - 업로드 한도 `client_max_body_size 110M`은 Spring `max-request-size 110MB`와 같아야 합니다.
-- CSP는 `Content-Security-Policy-Report-Only`로 먼저 적용하고 V-51 통과 후 강제로 전환합니다.
+- CSP는 `Content-Security-Policy-Report-Only`로 먼저 적용한 뒤 V-51 통과 후 강제(`Content-Security-Policy`)로 전환했습니다(T5-4, `csp-spa.conf.template`).
 - 외부 공개 포트는 `80` 하나이며 PostgreSQL·RustFS는 `127.0.0.1`에만 바인딩합니다. 백엔드 이미지(`music-backend`)는 이 저장소에서 빌드하지 않습니다.
 
-## 명령어 (구현 후 사용, PRD §8 기준)
+## 명령어 (PRD §8 기준)
 
 ```bash
 docker compose up -d                          # 전체 스택 기동 (nginx는 service_started 기준으로 대기)
 docker compose restart nginx                  # 템플릿 수정 후 재치환
+docker compose config --quiet                 # compose 문법 검증 (config는 .env 시크릿을 출력하므로 --quiet만 사용)
 docker exec nginx-proxy nginx -t              # V-01 문법 검증
-docker exec nginx-proxy grep -nE "server |Host |proxy_pass" /etc/nginx/nginx.conf   # V-02 치환 결과
+docker exec nginx-proxy sh -c "grep -nE 'server |Host |proxy_pass' /etc/nginx/nginx.conf"   # V-02 치환 결과 (Git Bash 경로 변환을 피하려고 sh -c 사용)
 docker logs nginx-proxy                       # upstream:/cache:/rt= 확인 (V-25)
-bash scripts/smoke.sh                         # V-01~V-25 정적·스모크 (작성 예정)
+bash scripts/smoke.sh                         # V-10~V-25 스모크 (BASE_URL 기본 http://localhost, 14개 PASS 기준)
 ```
 
-단일 검증 항목은 PRD §8의 ID(V-xx)별 curl 명령을 그대로 실행합니다. 결과(통과/실패/미확인)와 근거는 `scripts/integration-checklist.md`에 기록하며, 직접 확인하지 못한 항목을 통과로 적지 않습니다. 미확인 사항(V-30 `Content-Disposition` 유지, V-33 Range, V-24 `proxy_request_buffering off`의 413 동작, RustFS 경로별 정책)은 PRD §11.3에 있습니다.
+- 컨테이너 이름은 `nginx-proxy`, `postgres-db`, `rustfs`, `web-server-1/2`, `storage-init`입니다. nginx 이미지는 `nginx:1.30-alpine`입니다.
+- 스모크의 업로드 속도 제한 호출은 실행당 3회라 연속 실행해도 `429`가 나지 않습니다. `429`가 나면 1분 뒤 재실행합니다.
+- Git Bash는 `/`로 시작하는 인자를 윈도우 경로로 바꿉니다. `docker exec`는 `sh -c "..."`로 감싸고, `docker run`에는 `MSYS_NO_PATHCONV=1`을 붙입니다.
+- 백엔드 없이 템플릿만 검증하는 절차는 `.claude/skills/nginx-standalone-verify/SKILL.md`에 있습니다.
+
+단일 검증 항목은 PRD §8의 ID(V-xx)별 curl 명령을 그대로 실행합니다. 결과(통과/실패/미확인)와 근거는 `scripts/integration-checklist.md`에 기록하며, 직접 확인하지 못한 항목을 통과로 적지 않습니다. 현재 미확인은 V-41(개발 서버 `:5173` 경유 로그인), `/artwork/*` 실제 `Content-Type`(앨범아트 있는 곡 없음)이며 사유는 PRD §11.3에 있습니다. 확정된 설정 변경(`/assets/`·`/artwork/`의 `Cache-Control` `always` 제거, CSP 강제 전환 등)은 PRD §11.2에 기록되어 있습니다.
 
 ## 환경·규칙
 
