@@ -1,0 +1,6 @@
+# 공통 보안 헤더 (PRD §3.7): SPA, /assets, /stream, /artwork에서 include한다.
+# /api, /oauth2, /login/oauth2는 Spring Security가 헤더를 붙이므로 포함하지 않는다.
+# /internal-storage, /healthz에도 포함하지 않는다(X-Accel-Redirect 응답 헤더 유지).
+# 주의: add_header는 location 단위로 상속이 끊기므로 대상 location마다 include해야 한다.
+#       오류 응답(404/502 등)에도 MIME 스니핑을 막아야 하므로 always를 쓴다.
+add_header X-Content-Type-Options "nosniff" always;

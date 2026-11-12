@@ -1,0 +1,178 @@
+user  nginx;
+worker_processes  auto;
+error_log  /var/log/nginx/error.log notice;
+pid        /var/run/nginx.pid;
+
+events {
+    worker_connections  1024;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+    server_tokens off;
+
+    # [필수] 접근 로그에서 JWT(token 쿼리)를 마스킹한다 (PRD §3.8)
+    # 이름 있는 캡처의 ${...}는 NGINX_ENVSUBST_FILTER=^(BACKEND_|STORAGE_) 덕분에 envsubst가 건드리지 않는다
+    map $request $loggable_request {
+        ~^(?<reqBefore>.*[?&]token=)[^&\s]*(?<reqAfter>.*)$  "${reqBefore}***${reqAfter}";
+        default $request;
+    }
+    map $http_referer $loggable_referer {
+        ~^(?<refBefore>.*[?&]token=)[^&\s]*(?<refAfter>.*)$  "${refBefore}***${refAfter}";
+        default $http_referer;
+    }
+    log_format  main  '$remote_addr - $remote_user [$time_local] "$loggable_request" '
+                      '$status $body_bytes_sent "$loggable_referer" "$http_user_agent" '
+                      'upstream: $upstream_addr cache: $upstream_cache_status rt=$request_time';
+    access_log  /var/log/nginx/access.log  main;
+
+    sendfile        on;
+    tcp_nopush      on;
+    tcp_nodelay     on;
+    keepalive_timeout  65;
+    gzip on;
+    gzip_types text/css application/javascript application/json image/svg+xml;
+
+    # 업로드 상한: 백엔드 max-request-size(110MB)와 동일
+    client_max_body_size 110M;
+
+    # stream과 artwork가 같은 존을 공유한다 (키는 $uri)
+    proxy_cache_path /var/cache/nginx/hls_cache levels=1:2 keys_zone=hls_cache:10m max_size=2g inactive=24h use_temp_path=off;
+
+    limit_req_zone $binary_remote_addr zone=upload_limit:10m rate=30r/m;
+    limit_req_zone $binary_remote_addr zone=auth_limit:10m   rate=30r/m;
+    limit_req_status 429;
+
+    upstream backend_cluster {
+        server ${BACKEND_UPSTREAM_1} max_fails=3 fail_timeout=10s;
+        server ${BACKEND_UPSTREAM_2} max_fails=3 fail_timeout=10s;
+        keepalive 32;
+    }
+
+    upstream s3_storage {
+        server ${STORAGE_UPSTREAM};
+        keepalive 32;
+    }
+
+    server {
+        listen       80 default_server;
+        server_name  _;
+
+        # 컨테이너 헬스체크 (SPA 존재 여부와 무관)
+        location = /healthz {
+            access_log off;
+            default_type text/plain;
+            return 200 "ok\n";
+        }
+
+        # 1-a. 업로드: 요청 본문을 디스크에 버퍼링하지 않고 전달한다.
+        # 비멱등 요청이므로 proxy_next_upstream 기본값을 유지한다(재시도 없음).
+        location = /api/tracks/upload {
+            limit_req zone=upload_limit burst=10 nodelay;
+            proxy_request_buffering off;
+            include /etc/nginx/snippets/proxy-backend.conf;
+        }
+
+        # 1-b. 로그인 진입: 속도 제한 (PRD §3.9)
+        location = /oauth2/authorization/google {
+            limit_req zone=auth_limit burst=10 nodelay;
+            include /etc/nginx/snippets/proxy-backend.conf;
+        }
+
+        # 413(본문 초과)을 백엔드 에러 형식과 같은 JSON으로 응답한다 (PRD §3.5)
+        # Nginx가 직접 만든 413에만 적용된다(proxy_intercept_errors 기본값 off라 백엔드 응답은 그대로 통과).
+        error_page 413 @payload_too_large;
+        location @payload_too_large {
+            internal;
+            # add_header를 두지 않는다: 상속 충돌 없이 Content-Type만 JSON으로 지정한다
+            default_type application/json;
+            return 413 '{"code":"PAYLOAD_TOO_LARGE","message":"업로드 가능한 최대 용량(110MB)을 초과했습니다.","timestamp":"$time_iso8601"}';
+        }
+
+        # 1-c. 그 외 백엔드 경로 (/api 단독 포함)
+        location ~ ^/(api|oauth2|login/oauth2)(/|$) {
+            include /etc/nginx/snippets/proxy-backend.conf;
+        }
+
+        # 2-a. HLS 매니페스트: 짧은 캐시 (정규식 location이 접두 location보다 우선한다)
+        location ~ ^/stream/.+\.m3u8$ {
+            proxy_cache_valid 200 5s;
+            include /etc/nginx/snippets/proxy-hls.conf;
+        }
+
+        # 2-b. HLS 청크 및 기타: 장기 캐시
+        location /stream/ {
+            proxy_cache_valid 200 24h;
+            include /etc/nginx/snippets/proxy-hls.conf;
+        }
+
+        # 3. 앨범 커버: 파일명이 UUID라 불변이므로 7일 immutable 캐시 (PRD §3.4)
+        # 접두 location이라 proxy_pass에 URI를 쓸 수 있다(rewrite 불필요).
+        # stream 전용 스니펫(proxy-hls.conf)은 rewrite·OPTIONS 처리를 포함하므로 재사용하지 않는다.
+        location /artwork/ {
+            limit_except GET HEAD {
+                deny all;
+            }
+            proxy_pass http://s3_storage/${STORAGE_BUCKET_NAME}/artwork/;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header Host ${STORAGE_HOST_HEADER};
+            # 클라이언트 인증 헤더는 RustFS(익명 읽기)로 전달하지 않는다
+            proxy_set_header Authorization "";
+            proxy_hide_header x-amz-id-2;
+            proxy_hide_header x-amz-request-id;
+
+            # hls_cache 존 공유: 키는 $uri(/artwork/...)라 stream(/버킷/hls/...)과 겹치지 않는다
+            proxy_cache hls_cache;
+            proxy_cache_key "$uri";
+            proxy_cache_lock on;
+            proxy_cache_valid 200 7d;
+
+            # Cache-Control은 always 없음: 404/502 등 오류 응답에 immutable이 붙지 않게 한다 (PRD §11.2 #13)
+            add_header Cache-Control "public, max-age=604800, immutable";
+            add_header X-Cache-Status $upstream_cache_status always;
+            add_header Access-Control-Allow-Origin * always;
+            include /etc/nginx/snippets/security-headers.conf;
+        }
+
+        # 4. 원본 다운로드 전용 내부 경로 (X-Accel-Redirect, PRD §3.2)
+        # internal이라 외부 직접 호출은 404다. 백엔드가 보낸 presigned URL로만 진입한다.
+        # proxy_pass는 URI를 포함한 접두 location 형태를 쓴다. 변수나 rewrite를 쓰면
+        # 쿼리 문자열(X-Amz-Signature 등)이 재인코딩되어 서명 검증이 깨진다.
+        # add_header를 두지 않는다: 헤더는 백엔드의 X-Accel-Redirect 응답 값이 유지된다.
+        location /internal-storage/ {
+            internal;
+            proxy_pass http://s3_storage/${STORAGE_BUCKET_NAME}/;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            # presigned 서명의 Host와 일치해야 한다 (백엔드 STORAGE_ENDPOINT의 host:port)
+            proxy_set_header Host ${STORAGE_HOST_HEADER};
+            proxy_set_header Authorization "";
+            # [계획] 유지 여부는 V-30(T5-1)에서 결정한다
+            proxy_hide_header Content-Disposition;
+            proxy_hide_header x-amz-id-2;
+            proxy_hide_header x-amz-request-id;
+            # 대용량 원본(최대 100MB)을 디스크 버퍼링 없이 전송한다
+            proxy_buffering off;
+        }
+
+        # 5-a. Vite 해시 자산: 장기 캐시, 없으면 404 (index.html로 대체 응답 방지)
+        location /assets/ {
+            root /usr/share/nginx/html;
+            try_files $uri =404;
+            add_header Cache-Control "public, max-age=31536000, immutable";  # always 없음: 404에는 붙지 않게 한다
+            include /etc/nginx/snippets/security-headers.conf;
+        }
+
+        # 5-b. SPA: 새 빌드가 즉시 반영되도록 no-cache
+        location / {
+            root   /usr/share/nginx/html;
+            index  index.html;
+            try_files $uri $uri/ /index.html;
+            add_header Cache-Control "no-cache" always;
+            include /etc/nginx/snippets/security-headers.conf;
+            include /etc/nginx/snippets/csp-spa.conf;
+        }
+    }
+}
